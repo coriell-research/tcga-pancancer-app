@@ -14,9 +14,7 @@ suppressPackageStartupMessages(library(here))
 suppressPackageStartupMessages(library(data.table))
 suppressPackageStartupMessages(library(GenomicRanges))
 suppressPackageStartupMessages(library(duckdb))
-suppressPackageStartupMessages(library(dbplyr))
-suppressPackageStartupMessages(library(dplyr))
-suppressPackageStartupMessages(library(maftools))
+suppressPackageStartupMessages(library(tidyverse))
 ```
 
 ## Create a database connection
@@ -289,6 +287,67 @@ tbl(con, "mut") |>
   filter(Gene == "CDK9") |> 
   left_join(y = {  tbl(con, "clinical") }, by = "SampleBarcode") |> 
   collect()
+```
+
+## How should joins work in the app?
+
+- Allow for x and y to be different data types
+- Allow for multiple cancer_types to be selected
+
+```{r}
+# User selects the data type for the x and y variables
+x_tbl <- "expr"
+y_tbl <- "meth"
+
+xvar <- switch(x_tbl, 
+  "expr" = "Expression",
+  "cn" = "CopyNumber",
+  "meth" = "meanBeta"
+  )
+
+yvar <- switch(y_tbl, 
+  "expr" = "Expression",
+  "cn" = "CopyNumber",
+  "meth" = "meanBeta"
+  )
+
+# User selects what genes on the x and y-axis
+x_gene <- "CDK12"
+y_gene <- "CDK9"
+
+# User selects what cancer types to include in all plots
+types <- c("PRAD", "BRCA", "ACC")
+
+# Select data to color by
+colvar <- "age"
+```
+
+Can we make duckdb do all of the work?
+
+```{r}
+data2 <- inner_join(
+  x = {
+    tbl(con, x_tbl) |> 
+    filter(Gene == x_gene) |> 
+    semi_join(y = { tbl(con, "clinical") |> filter(cancer_type %in% types) }, by = join_by(SampleBarcode))
+  }, 
+  y = {
+    tbl(con, y_tbl) |> 
+    filter(Gene == y_gene) |> 
+    semi_join(y = { tbl(con, "clinical") |> filter(cancer_type %in% types) }, by = join_by(SampleBarcode))
+  },
+  by = join_by(SampleBarcode)
+  ) |> 
+  left_join(y = tbl(con, "clinical"), by = join_by(SampleBarcode)) |> 
+  collect()
+```
+
+Then we need to evaluate the input to create the plot. 
+
+```{r}
+ggplot(data2, aes(x = .data[[xvar]], y = .data[[yvar]], color = .data[[colvar]])) +
+  geom_point(pch = 16, size = 3, alpha = 0.1) +
+  theme_minimal()
 ```
 
 ## Close database connection
