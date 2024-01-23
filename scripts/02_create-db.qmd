@@ -1,0 +1,298 @@
+---
+title: "Prepare PANCAN data for database"
+format: html
+---
+
+We look at this data so much maybe it would be useful to have an app to interactively
+explore it. To do this I'll have to read some of the data into memory and create tables
+for an out of memory database. I think I'll try duckdb for this. 
+
+## Load Libraries
+
+```{r}
+suppressPackageStartupMessages(library(here))
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(GenomicRanges))
+suppressPackageStartupMessages(library(duckdb))
+suppressPackageStartupMessages(library(dbplyr))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(maftools))
+```
+
+## Create a database connection
+
+```{r}
+con <- dbConnect(duckdb(), dbdir = here("appdata", "pancan.duckdb"))
+```
+
+## Clinical Data
+
+```{r}
+clinical <- fread(here("data", "Survival_SupplementalTable_S1_20171025_xena_sp"))
+clinical <- janitor::clean_names(clinical)
+setnames(clinical, 
+         old = c("sample", "cancer_type_abbreviation", "age_at_initial_pathologic_diagnosis"), 
+         new = c("SampleBarcode", "cancer_type", "age"))
+clinical
+```
+
+```{r}
+# Write the table to the database
+dbWriteTable(con, "clinical", clinical)
+
+# Create an index
+dbExecute(con, "CREATE INDEX clinical_idx ON clinical (cancer_type)")
+```
+
+## Gene expression
+
+We need the gene expression data indexed by gene. All of the matrices of expression however
+are in gene x sample format which might work. I think though that I may pivot the data 
+longer so every sample is multiplied by every gene in a more traditional relational db
+structure.
+
+### EB++ Normalized data from PANCAN
+
+```{r}
+eb <- fread(here("data", "EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.xena.gz"))
+
+# Remove the gene symbols that are just numbers for some reason
+eb <- eb[!sample %like% "^[0-9]"]
+
+# Pivot longer
+eb <- melt(
+  eb, 
+  id.vars = "sample", 
+  variable.name = "SampleBarcode",
+  value.name = "Expression",
+  variable.factor = FALSE, 
+  value.factor = FALSE
+  )
+
+setnames(eb, old = "sample", new = "Gene")
+setkey(eb, Gene)
+```
+
+Create the table in the database
+
+```{r}
+# Write the table to the database
+dbWriteTable(con, "expr", eb)
+
+# Create an index by gene name
+dbExecute(con, "CREATE INDEX expr_idx ON expr (Gene)")
+```
+
+## Copy Number
+
+```{r}
+cn <- fread(here("data", "TCGA.PANCAN.sampleMap-Gistic2_CopyNumber_Gistic2_all_data_by_genes.gz"))
+
+# Pivot longer
+cn <- melt(
+  cn, 
+  id.vars = "Sample", 
+  variable.name = "SampleBarcode",
+  value.name = "CopyNumber",
+  variable.factor = FALSE, 
+  value.factor = FALSE
+  )
+setnames(cn, old = "Sample", new = "Gene")
+setkey(cn, Gene)
+```
+
+Save the table to the database and index on Gene
+
+```{r}
+# Write the table to the database
+dbWriteTable(con, "cn", cn)
+
+# Create an index
+dbExecute(con, "CREATE INDEX cn_idx ON cn (Gene)")
+```
+
+## Methylation
+
+At this point I restart the R session to clean up memory usage. rm() + gc(full=TRUE) isn't
+cleaning up memory, probably because Rstudio keeps a pointer to something lying around.
+
+Read in the probe map and determine which of these probes overlaps 1000 bp upstream of
+protein coding genes.
+
+```{r}
+probe_map <- fread(here("data", "probeMap-illuminaMethyl450_hg19_GPL16304_TCGAlegacy"))
+probe_map <- probe_map[chrom != ""]
+
+probe_gr <- makeGRangesFromDataFrame(
+  probe_map, 
+  seqnames.field = "chrom", 
+  start.field = "chromStart", 
+  end.field = "chromEnd",
+  strand.field = "strand", 
+  keep.extra.columns = TRUE
+  )
+```
+
+```{r}
+# Get the gene ranges for hg19 genes (since that's what the probe map has
+gtf_file <- here("data", "gencode.v19.annotation.gtf.gz")
+url <- "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_19/gencode.v19.annotation.gtf.gz"
+if (!file.exists(gtf_file)) {
+  download.file(url, gtf_file)
+}
+gtf <- rtracklayer::import(gtf_file)
+```
+
+Find which CpGs overlap the promoter regions of coding genes
+
+```{r}
+# Extract the promoter regions for coding genes
+gene_gr <- subset(gtf, type == "gene" & gene_type == "protein_coding")
+promoter_gr <- promoters(gene_gr, upstream = 1000, downstream = 500)
+
+# Which of the probes overlap with promoters?
+ov <- findOverlaps(probe_gr, promoter_gr, type = "within")
+```
+
+Create a mapping from Probe to Genes
+
+```{r}
+probes <- DataFrame(
+  Probes = probe_gr[queryHits(ov), ],
+  Genes = gene_gr[subjectHits(ov), ]
+  )
+probes <- probes[, c("Probes..id", "Genes.gene_name")]
+probes <- setDT(data.frame(probes))
+names(probes) <- c("Probe", "Gene")
+setkey(probes, Probe)
+```
+
+Read in the entire methylation file. This is huge! and probably not the best way to do this but
+it might be the most straightforward. It's about ~60Gb after reading in.
+
+```{r}
+meth <- fread(
+  here("data", "jhu-usc.edu_PANCAN_HumanMethylation450.betaValue_whitelisted.tsv.synapse_download_5096262.xena.gz"),
+  nThread = 48,
+  showProgress = FALSE
+  )
+```
+
+Remove any probes not in gene promoters
+
+```{r}
+keep_probes <- probes[, unique(Probe)]
+setnames(meth, old = "sample", new = "Probe")
+meth <- meth[Probe %chin% keep_probes]
+setkey(meth, Probe)
+```
+
+Join the gene names onto the probes
+
+```{r}
+meth <- probes[meth]
+```
+
+Pivot the data longer
+
+```{r}
+meth <- melt(
+  meth,
+  id.vars = c("Probe", "Gene"), 
+  variable.name = "SampleBarcode",
+  value.name = "BetaValue",
+  variable.factor = FALSE, 
+  value.factor = FALSE
+  )
+```
+
+Summarize the data at the gene level
+
+```{r}
+meth_by_gene <- meth[, .(meanBeta = mean(BetaValue, na.rm=TRUE),
+                         medianBeta = median(BetaValue, na.rm=TRUE),
+                         minBeta = min(BetaValue, na.rm=TRUE),
+                         maxBeta = max(BetaValue, na.rm=TRUE),
+                         sdBeta = sd(BetaValue, na.rm=TRUE),
+                         N_probes = .N), 
+                     by = .(Gene, SampleBarcode)]
+```
+
+Save the table to the database
+
+```{r}
+# Write the table to the database
+dbWriteTable(con, "meth", meth_by_gene)
+
+# Create an index
+dbExecute(con, "CREATE INDEX meth_idx ON meth (Gene)")
+```
+
+## Mutations
+
+Read in the MAF file for all samples
+
+```{r}
+mutations <- fread(here("data", "mc3.v0.2.8.PUBLIC.xena.gz"), key = "gene")
+mutations <- janitor::clean_names(mutations)
+
+# Set the names to be consistent with the other tables
+setnames(mutations, old = c("sample", "gene"), new = c("SampleBarcode", "Gene"))
+
+# Summarize to the count level
+mutations <- mutations[, .N, by = .(Gene, SampleBarcode, effect)]
+```
+
+Write mutation data to database
+
+```{r}
+# Write the table to the database
+dbWriteTable(con, "mut", mutations)
+
+# Create an index
+dbExecute(con, "CREATE INDEX mut_idx ON mut (Gene)")
+```
+
+## Test the database connection
+
+### Genes
+
+```{r}
+tbl(con, "expr") |> 
+  filter(Gene == "CDK12") |> 
+  left_join(y = filter({ tbl(con, "clinical") }), by = "SampleBarcode") |> 
+  collect()
+```
+
+### Copy Number
+
+```{r}
+tbl(con, "cn") |> 
+  filter(Gene == "CDK12") |> 
+  left_join(y = {  tbl(con, "clinical") }, by = "SampleBarcode") |> 
+  collect()
+```
+
+### Methylation
+
+```{r}
+tbl(con, "meth") |> 
+  filter(Gene == "CDK12") |> 
+  left_join(y = {  tbl(con, "clinical") }, by = "SampleBarcode") |> 
+  collect()
+```
+
+### Mutations
+
+```{r}
+tbl(con, "mut") |> 
+  filter(Gene == "CDK9") |> 
+  left_join(y = {  tbl(con, "clinical") }, by = "SampleBarcode") |> 
+  collect()
+```
+
+## Close database connection
+
+```{r}
+dbDisconnect(con)
+```
