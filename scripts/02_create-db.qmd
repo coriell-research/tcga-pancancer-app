@@ -236,16 +236,65 @@ mutations <- janitor::clean_names(mutations)
 
 # Set the names to be consistent with the other tables
 setnames(mutations, old = c("sample", "gene"), new = c("SampleBarcode", "Gene"))
+```
 
-# Summarize to the count level
-mutations <- mutations[, .N, by = .(Gene, SampleBarcode, effect)]
+Count up the number of damaging mutations for each sample/gene according to the DepMap definitions:
+
+https://forum.depmap.org/t/what-is-the-variant-annotation-column-and-how-is-function-of-mutations-annotated/105/2
+
+Damaging
+
+- Start_Codon_SNP
+- Start_Codon_Del
+- Start_Codon_Ins
+- Splice_Site
+- Frame_Shift_Del
+- Frame_Shift_Ins
+- Nonsense_Mutation
+- De_novo_Start_OutOfFrame
+
+Other non-conserving
+
+- Missense_Mutation
+- In_Frame_Del
+- In_Frame_Ins
+- Nonstop_Mutation
+- Stop_Codon_Del
+- Stop_Codon_Ins
+
+Other conserving
+
+- 5’Flank
+- Intron
+- IGR
+- 3’UTR
+- 5’UTR
+
+I also want to keep 0 counts around for samples and genes. 
+
+```{r}
+damaging <- c("Start_Codon_SNP", "Start_Codon_Del", "Start_Codon_Ins", "Splice_Site", 
+              "Frame_Shift_Del", "Frame_Shift_Ins", "Nonsense_Mutation", 
+              "De_novo_Start_OutOfFrame")
+mutations <- mutations[effect %chin% damaging, .(Mutations = .N), by = .(SampleBarcode, Gene)]
+
+# In order to keep around 0 counts, cast wider to add 0s and then reshape longer
+mutations.w <- dcast(mutations, Gene ~ SampleBarcode, value.var = "Mutations", fill = 0L)
+mutations2 <- melt(
+  mutations.w, 
+  id.vars = "Gene",
+  variable.name = "SampleBarcode", 
+  value.name = "Mutations", 
+  variable.factor = FALSE, 
+  value.factor = FALSE
+  )
 ```
 
 Write mutation data to database
 
 ```{r}
 # Write the table to the database
-dbWriteTable(con, "mut", mutations)
+dbWriteTable(con, "mut", mutations2, overwrite=TRUE)
 
 # Create an index
 dbExecute(con, "CREATE INDEX mut_idx ON mut (Gene)")
@@ -297,7 +346,7 @@ tbl(con, "mut") |>
 ```{r}
 # User selects the data type for the x and y variables
 x_tbl <- "expr"
-y_tbl <- "meth"
+y_tbl <- "mut"
 
 xvar <- switch(x_tbl, 
   "expr" = "Expression",
@@ -308,7 +357,8 @@ xvar <- switch(x_tbl,
 yvar <- switch(y_tbl, 
   "expr" = "Expression",
   "cn" = "CopyNumber",
-  "meth" = "meanBeta"
+  "meth" = "meanBeta",
+  "mut" = "Mutations"
   )
 
 # User selects what genes on the x and y-axis
@@ -325,7 +375,7 @@ colvar <- "age"
 Can we make duckdb do all of the work?
 
 ```{r}
-data2 <- inner_join(
+data <- inner_join(
   x = {
     tbl(con, x_tbl) |> 
     filter(Gene == x_gene) |> 
@@ -345,7 +395,7 @@ data2 <- inner_join(
 Then we need to evaluate the input to create the plot. 
 
 ```{r}
-ggplot(data2, aes(x = .data[[xvar]], y = .data[[yvar]], color = .data[[colvar]])) +
+ggplot(data, aes(x = .data[[xvar]], y = .data[[yvar]], color = .data[[colvar]])) +
   geom_point(pch = 16, size = 3, alpha = 0.1) +
   theme_minimal()
 ```
