@@ -9,16 +9,9 @@ suppressPackageStartupMessages(library(ggbeeswarm))
 
 
 # Override ggplot2 defaults
-theme_set(theme_minimal())
+theme_set(theme_light())
 options(ggplot2.continuous.colour = "viridis")
 options(ggplot2.continuous.fill = "viridis")
-
-scale_fill_discrete <- function(...) {
-  scale_fill_manual(..., values = as.character(paletteer::paletteer_d("ggsci::default_igv")))
-}
-scale_color_discrete <- function(...) {
-  scale_color_manual(..., values = as.character(paletteer::paletteer_d("ggsci::default_igv")))
-}
 
 # Connect to the database and establish choices
 con <- dbConnect(duckdb(), "appdata/pancan.duckdb", read_only = TRUE)
@@ -41,7 +34,7 @@ col_choices <- data.frame(
 
 ui <- fluidPage(
   theme = bslib::bs_theme(bootswatch = "flatly"),
-  titlePanel("TCGA PanCancer Data Explorer"),
+  titlePanel("TCGA PanCancer Data Explorer (alpha)"),
   sidebarLayout(
     sidebarPanel(
       width = 2,
@@ -83,10 +76,11 @@ ui <- fluidPage(
     mainPanel(
       tabsetPanel(
         tabPanel(
-          "Scatter",
+          "scatter",
           fluidRow(
             column(
               2,
+              numericInput("psize", "Point Size", value = 3, min = 1, max = 10, step = 1),
               numericInput("alpha", "Point Alpha", value = 0.5, min = 0, max = 1, step = 0.1),
               checkboxInput("trend", "Fit Trendline", value = FALSE),
               checkboxInput("smooth", "Fit Smoother", value = FALSE),
@@ -96,7 +90,8 @@ ui <- fluidPage(
                 "Color By",
                 choices = setNames(col_choices$id, col_choices$names),
                 selected = "N/A"
-              )
+              ),
+              downloadButton("download"),
             ),
             column(10, plotOutput("scatter", brush = "scatter_brush"))
           ),
@@ -107,6 +102,8 @@ ui <- fluidPage(
           fluidRow(
             column(
               2,
+              numericInput("xsize", "Point Size", value = 1, min = 1, max = 10, step = 1),
+              numericInput("xalpha", "Point Alpha", value = 0.5, min = 0.1, max = 1, step = 0.1),
               selectInput(
                 "x_col",
                 "Color By",
@@ -123,6 +120,8 @@ ui <- fluidPage(
           fluidRow(
             column(
               2,
+              numericInput("ysize", "Point Size", value = 1, min = 1, max = 10, step = 1),
+              numericInput("yalpha", "Point Alpha", value = 0.5, min = 0.1, max = 1, step = 0.1),
               selectInput(
                 "y_col",
                 "Color By",
@@ -133,6 +132,10 @@ ui <- fluidPage(
             column(10, plotOutput("y_axis")),
             gt_output("ydata")
           )
+        ),
+        tabPanel(
+          "about",
+          htmltools::includeMarkdown("appdata/about.md")
         )
       )
     )
@@ -175,8 +178,7 @@ server <- function(input, output, session) {
     return(df)
   })
 
-
-  output$scatter <- renderPlot(
+  scatter_plot <- reactive(
     {
       x_var <- switch(input$x_tbl,
         "expr" = "Expression",
@@ -205,7 +207,7 @@ server <- function(input, output, session) {
           color = if (input$scatter_col == "N/A") NULL else .data[[input$scatter_col]]
         )
       ) +
-        geom_point(size = 3, pch = 16, alpha = input$alpha) +
+        geom_point(size = input$psize, pch = 16, alpha = input$alpha) +
         labs(
           title = paste(input$x_gene, "vs.", input$y_gene),
           x = paste0(input$x_gene, " (", tbl_choices$names[tbl_choices$id == input$x_tbl], ")"),
@@ -214,17 +216,23 @@ server <- function(input, output, session) {
         ) +
         theme(
           plot.title = element_text(face = "bold", size = 18),
+          plot.subtitle = element_text(size = 12),
           axis.text.x = element_text(size = 14),
           axis.text.y = element_text(size = 14),
           legend.position = "right"
         )
 
       if (input$trend) {
-        p <- p + geom_smooth(method = "lm", color = "red2")
+        mod <- lm(data()[[y_var]] ~ data()[[x_var]])
+        b <- round(coef(mod)[1], 2)
+        m <- round(coef(mod)[2], 2)
+        eq <- paste0("y ~ ", m, "x", " + ", b)
+        
+        p <- p + geom_smooth(method = "lm", color = "red2") + labs(subtitle = eq)
       }
 
       if (input$smooth) {
-        p <- p + geom_smooth(method = "gam")
+        p <- p + geom_smooth(color = "blue2")
       }
       
       if (input$rug) {
@@ -232,10 +240,9 @@ server <- function(input, output, session) {
       }
 
       return(p)
-    },
-    res = 100
+    }
   )
-
+  output$scatter <- renderPlot(scatter_plot(), res = 100)
 
   output$data <- render_gt({
     x_var <- switch(input$x_tbl,
@@ -276,8 +283,7 @@ server <- function(input, output, session) {
       opt_interactive(use_compact_mode = TRUE)
   })
 
-
-  output$x_axis <- renderPlot(
+  xplot <- reactive(
     {
       x_var <- switch(input$x_tbl,
         "expr" = "Expression",
@@ -296,7 +302,7 @@ server <- function(input, output, session) {
           y = .data[[x_var]],
           color = if (input$x_col == "N/A") NULL else .data[[input$x_col]]
         )) +
-        geom_quasirandom(size = 3, pch = 16, alpha = 0.8) +
+        geom_quasirandom(size = input$xsize, pch = 16, alpha = input$xalpha) +
         stat_summary(aes(group = cancer_type), fun = median, geom = "crossbar", color = "red2", width = 0.7, lwd = 0.5) +
         labs(
           title = paste("Distribution of", input$x_gene, tbl_choices$names[tbl_choices$id == input$x_tbl]),
@@ -310,9 +316,9 @@ server <- function(input, output, session) {
           axis.text.x = element_text(size = 14, angle = 45, hjust = 1),
           axis.text.y = element_text(size = 14)
         )
-    },
-    res = 100
+    }
   )
+  output$x_axis <- renderPlot(xplot(), res = 100)
   
   output$xdata <- render_gt({
     x_var <- switch(input$x_tbl,
@@ -356,9 +362,8 @@ server <- function(input, output, session) {
       opt_interactive(use_compact_mode = TRUE)
     
   })
-  
 
-  output$y_axis <- renderPlot(
+  yplot <- reactive(
     {
       y_var <- switch(input$y_tbl,
         "expr" = "Expression",
@@ -377,7 +382,7 @@ server <- function(input, output, session) {
           y = .data[[y_var]],
           color = if (input$y_col == "N/A") NULL else .data[[input$y_col]]
         )) +
-        geom_quasirandom(size = 3, pch = 16, alpha = 0.8) +
+        geom_quasirandom(size = input$ysize, pch = 16, alpha = input$yalpha) +
         stat_summary(aes(group = cancer_type), fun = median, geom = "crossbar", color = "red2", width = 0.7, lwd = 0.5) +
         labs(
           title = paste("Distribution of", input$y_gene, tbl_choices$names[tbl_choices$id == input$y_tbl]),
@@ -391,9 +396,9 @@ server <- function(input, output, session) {
           axis.text.x = element_text(size = 14, angle = 45, hjust = 1),
           axis.text.y = element_text(size = 14)
         )
-    },
-    res = 100
+    }
   )
+  output$y_axis <- renderPlot(yplot(), res = 100)
   
   output$ydata <- render_gt({
     y_var <- switch(input$y_tbl,
@@ -437,6 +442,26 @@ server <- function(input, output, session) {
       opt_interactive(use_compact_mode = TRUE)
     
   })
+  
+  output$download <- downloadHandler(
+    filename = function() {
+      paste0("tcga-pancan_", format(Sys.time(), "%Y-%m-%d"), ".zip")
+    },
+    content = function(file) {
+      
+      tmp <- tempdir()
+      setwd(tmp)
+      
+      data_file <- data.table::fwrite(data(), "tcga-pancan-data.tsv", sep="\t")
+      scatter_plot <- ggsave("scatter-plot.pdf", plot = scatter_plot(), device = "pdf", width = 10, height = 6)
+      x_plot <- ggsave("x-axis-violin-plot.pdf", plot = xplot(), device = "pdf", width = 11, height = 7)
+      y_plot <- ggsave("y-axis-violin-plot.pdf", plot = yplot(), device = "pdf", width = 11, height = 7)
+      files <- c("tcga-pancan-data.tsv", "scatter-plot.pdf", "x-axis-violin-plot.pdf", "y-axis-violin-plot.pdf")
+      
+      zip(zipfile = file, files = files)
+    }, 
+    contentType = "application/zip"
+  )
 }
 
 # Run the application
