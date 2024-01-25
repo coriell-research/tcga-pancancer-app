@@ -31,7 +31,6 @@ clinical <- janitor::clean_names(clinical)
 setnames(clinical, 
          old = c("sample", "cancer_type_abbreviation", "age_at_initial_pathologic_diagnosis"), 
          new = c("SampleBarcode", "cancer_type", "age"))
-clinical
 ```
 
 ```{r}
@@ -131,8 +130,9 @@ probe_gr <- makeGRangesFromDataFrame(
   )
 ```
 
+Get the gene ranges for hg19 genes (since that's what the probe map has)
+
 ```{r}
-# Get the gene ranges for hg19 genes (since that's what the probe map has
 gtf_file <- here("data", "gencode.v19.annotation.gtf.gz")
 url <- "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_19/gencode.v19.annotation.gtf.gz"
 if (!file.exists(gtf_file)) {
