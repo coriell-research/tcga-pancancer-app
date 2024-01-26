@@ -1,9 +1,9 @@
 suppressPackageStartupMessages(library(shiny))
 suppressPackageStartupMessages(library(shinyWidgets))
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(pool))
 suppressPackageStartupMessages(library(duckdb))
 suppressPackageStartupMessages(library(dbplyr))
-suppressPackageStartupMessages(library(dplyr))
-suppressPackageStartupMessages(library(tidyverse))
 suppressPackageStartupMessages(library(gt))
 suppressPackageStartupMessages(library(ggbeeswarm))
 
@@ -14,7 +14,15 @@ options(ggplot2.continuous.colour = "viridis")
 options(ggplot2.continuous.fill = "viridis")
 
 # Connect to the database and establish choices
-con <- dbConnect(duckdb(), "appdata/pancan.duckdb", read_only = TRUE)
+pool <- dbPool(
+  drv = duckdb(),
+  dbdir = "appdata/pancan.duckdb", 
+  read_only = TRUE
+)
+
+onStop(function() { poolClose(pool) })
+
+# Initialize choices
 genelist <- readRDS("appdata/genes.rds")
 cancers <- readRDS("appdata/cancers.rds")
 
@@ -150,22 +158,22 @@ server <- function(input, output, session) {
   data <- reactive({
     df <- inner_join(
       x = {
-        tbl(con, input$x_tbl) |>
+        tbl(pool, input$x_tbl) |>
           filter(Gene == !!input$x_gene) |>
           semi_join(y = {
-            tbl(con, "clinical") |> filter(cancer_type %in% !!input$types)
+            tbl(pool, "clinical") |> filter(cancer_type %in% !!input$types)
           }, by = join_by(SampleBarcode))
       },
       y = {
-        tbl(con, input$y_tbl) |>
+        tbl(pool, input$y_tbl) |>
           filter(Gene == !!input$y_gene) |>
           semi_join(y = {
-            tbl(con, "clinical") |> filter(cancer_type %in% !!input$types)
+            tbl(pool, "clinical") |> filter(cancer_type %in% !!input$types)
           }, by = join_by(SampleBarcode))
       },
       by = join_by(SampleBarcode)
     ) |>
-      left_join(y = tbl(con, "clinical"), by = join_by(SampleBarcode)) |>
+      left_join(y = tbl(pool, "clinical"), by = join_by(SampleBarcode)) |>
       collect()
 
     validate(
